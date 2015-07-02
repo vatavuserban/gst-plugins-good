@@ -568,7 +568,7 @@ streamon_failed:
   }
 }
 
-static void
+static gboolean
 gst_v4l2_buffer_pool_streamoff (GstV4l2BufferPool * pool)
 {
   GstV4l2Object *obj = pool->obj;
@@ -580,19 +580,24 @@ gst_v4l2_buffer_pool_streamoff (GstV4l2BufferPool * pool)
     case GST_V4L2_IO_DMABUF_IMPORT:
       if (pool->streaming) {
         if (v4l2_ioctl (pool->video_fd, VIDIOC_STREAMOFF, &obj->type) < 0)
-          GST_WARNING_OBJECT (pool, "STREAMOFF failed with errno %d (%s)",
-              errno, g_strerror (errno));
+          goto streamoff_failed;
 
         pool->streaming = FALSE;
 
         GST_DEBUG_OBJECT (pool, "Stopped streaming");
-
-        if (pool->vallocator)
-          gst_v4l2_allocator_flush (pool->vallocator);
       }
       break;
     default:
       break;
+  }
+
+  return TRUE;
+
+streamoff_failed:
+  {
+    GST_ERROR_OBJECT (pool, "error with STREAMOFF %d (%s)", errno,
+        g_strerror (errno));
+    return FALSE;
   }
 }
 
@@ -822,7 +827,11 @@ gst_v4l2_buffer_pool_stop (GstBufferPool * bpool)
     pool->other_pool = NULL;
   }
 
-  gst_v4l2_buffer_pool_streamoff (pool);
+  if (!gst_v4l2_buffer_pool_streamoff (pool))
+    goto streamoff_failed;
+
+  if (pool->vallocator)
+    gst_v4l2_allocator_flush (pool->vallocator);
 
   for (i = 0; i < VIDEO_MAX_FRAME; i++) {
     if (pool->buffers[i]) {
@@ -831,8 +840,8 @@ gst_v4l2_buffer_pool_stop (GstBufferPool * bpool)
       pool->buffers[i] = NULL;
 
       if (V4L2_TYPE_IS_OUTPUT (pool->obj->type))
-        gst_v4l2_buffer_pool_release_buffer (bpool, buffer);
-      else                      /* Don't re-enqueue capture buffer on stop */
+        gst_buffer_unref (buffer);
+      else
         pclass->release_buffer (bpool, buffer);
 
       g_atomic_int_add (&pool->num_queued, -1);
@@ -853,6 +862,11 @@ gst_v4l2_buffer_pool_stop (GstBufferPool * bpool)
   }
 
   return ret;
+
+  /* ERRORS */
+streamoff_failed:
+  GST_ERROR_OBJECT (pool, "device refused to stop streaming");
+  return FALSE;
 }
 
 static void
@@ -889,7 +903,10 @@ gst_v4l2_buffer_pool_flush_stop (GstBufferPool * bpool)
   if (pool->other_pool)
     gst_buffer_pool_set_flushing (pool->other_pool, FALSE);
 
-  gst_v4l2_buffer_pool_streamoff (pool);
+  if (!gst_v4l2_buffer_pool_streamoff (pool))
+    goto stop_failed;
+
+  gst_v4l2_allocator_flush (pool->vallocator);
 
   /* Reset our state */
   switch (obj->mode) {
@@ -917,7 +934,9 @@ gst_v4l2_buffer_pool_flush_stop (GstBufferPool * bpool)
           gst_mini_object_set_qdata (GST_MINI_OBJECT (buffer),
               GST_V4L2_IMPORT_QUARK, NULL, NULL);
 
-          if (buffer->pool == NULL)
+          if (V4L2_TYPE_IS_OUTPUT (obj->type))
+            gst_buffer_unref (buffer);
+          else
             gst_v4l2_buffer_pool_release_buffer (bpool, buffer);
 
           g_atomic_int_add (&pool->num_queued, -1);
@@ -937,6 +956,14 @@ streamon:
     gst_v4l2_buffer_pool_streamon (pool);
 
   gst_poll_set_flushing (pool->poll, FALSE);
+
+  return;
+
+  /* ERRORS */
+stop_failed:
+  {
+    GST_ERROR_OBJECT (pool, "device refused to flush");
+  }
 }
 
 static GstFlowReturn
@@ -1093,10 +1120,6 @@ gst_v4l2_buffer_pool_dqbuf (GstV4l2BufferPool * pool, GstBuffer ** buffer)
   }
 #endif
 
-  /* Ignore timestamp and field for OUTPUT device */
-  if (V4L2_TYPE_IS_OUTPUT (obj->type))
-    goto done;
-
   /* set top/bottom field first if v4l2_buffer has the information */
   switch (group->buffer.field) {
     case V4L2_FIELD_NONE:
@@ -1141,7 +1164,6 @@ gst_v4l2_buffer_pool_dqbuf (GstV4l2BufferPool * pool, GstBuffer ** buffer)
 
   GST_BUFFER_TIMESTAMP (outbuf) = timestamp;
 
-done:
   *buffer = outbuf;
 
   return GST_FLOW_OK;
@@ -1276,9 +1298,7 @@ gst_v4l2_buffer_pool_release_buffer (GstBufferPool * bpool, GstBuffer * buffer)
         case GST_V4L2_IO_USERPTR:
         case GST_V4L2_IO_DMABUF_IMPORT:
         {
-          GstV4l2MemoryGroup *group;
-          if (gst_v4l2_is_buffer_valid (buffer, &group)) {
-            gst_v4l2_allocator_reset_group (pool->vallocator, group);
+          if (gst_v4l2_is_buffer_valid (buffer, NULL)) {
             /* queue back in the device */
             if (pool->other_pool)
               gst_v4l2_buffer_pool_prepare_buffer (pool, buffer, NULL);
@@ -1338,10 +1358,8 @@ gst_v4l2_buffer_pool_release_buffer (GstBufferPool * bpool, GstBuffer * buffer)
             /* playback, put the buffer back in the queue to refill later. */
             pclass->release_buffer (bpool, buffer);
           } else {
-            /* the buffer is queued in the device but maybe not played yet. We just
-             * leave it there and not make it available for future calls to acquire
-             * for now. The buffer will be dequeued and reused later. */
-            GST_LOG_OBJECT (pool, "buffer %u is queued", index);
+            /* We keep a ref on queued buffer, so this should never happen */
+            g_assert_not_reached ();
           }
           break;
         }
@@ -1362,6 +1380,12 @@ static void
 gst_v4l2_buffer_pool_dispose (GObject * object)
 {
   GstV4l2BufferPool *pool = GST_V4L2_BUFFER_POOL (object);
+  gint i;
+
+  for (i = 0; i < VIDEO_MAX_FRAME; i++) {
+    if (pool->buffers[i])
+      gst_buffer_replace (&(pool->buffers[i]), NULL);
+  }
 
   if (pool->vallocator)
     gst_object_unref (pool->vallocator);
@@ -1641,12 +1665,9 @@ gst_v4l2_buffer_pool_process (GstV4l2BufferPool * pool, GstBuffer ** buf)
 
           /* An empty buffer on capture indicates the end of stream */
           if (gst_buffer_get_size (tmp) == 0) {
-            gboolean corrupted = GST_BUFFER_FLAG_IS_SET (tmp,
-                GST_BUFFER_FLAG_CORRUPTED);
-
             gst_v4l2_buffer_pool_release_buffer (bpool, tmp);
 
-            if (corrupted)
+            if (GST_BUFFER_FLAG_IS_SET (*buf, GST_BUFFER_FLAG_CORRUPTED))
               goto buffer_corrupted;
             else
               goto eos;
@@ -1759,7 +1780,7 @@ gst_v4l2_buffer_pool_process (GstV4l2BufferPool * pool, GstBuffer ** buf)
             /* don't check return value because qbuf would have failed */
             gst_v4l2_is_buffer_valid (to_queue, &group);
 
-            /* qbuf has stored to_queue buffer but we are not in
+            /* qbuf has taken the ref of the to_queue buffer but we are no in
              * streaming state, so the flush logic won't be performed.
              * To avoid leaks, flush the allocator and restore the queued
              * buffer as non-queued */
@@ -1774,19 +1795,15 @@ gst_v4l2_buffer_pool_process (GstV4l2BufferPool * pool, GstBuffer ** buf)
             goto start_failed;
           }
 
-          /* Remove our ref, we will still hold this buffer in acquire as needed,
-           * otherwise the pool will think it is outstanding and will refuse to stop. */
-          gst_buffer_unref (to_queue);
-
           if (g_atomic_int_get (&pool->num_queued) >= pool->min_latency) {
             GstBuffer *out;
             /* all buffers are queued, try to dequeue one and release it back
              * into the pool so that _acquire can get to it again. */
             ret = gst_v4l2_buffer_pool_dqbuf (pool, &out);
-            if (ret == GST_FLOW_OK && out->pool == NULL)
+            if (ret == GST_FLOW_OK)
               /* release the rendered buffer back into the pool. This wakes up any
                * thread waiting for a buffer in _acquire(). */
-              gst_v4l2_buffer_pool_release_buffer (bpool, out);
+              gst_buffer_unref (out);
           }
           break;
         }
