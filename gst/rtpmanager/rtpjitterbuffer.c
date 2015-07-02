@@ -672,6 +672,8 @@ rtp_jitter_buffer_insert (RTPJitterBuffer * jbuf, RTPJitterBufferItem * item,
   g_return_val_if_fail (jbuf != NULL, FALSE);
   g_return_val_if_fail (item != NULL, FALSE);
 
+  GST_DEBUG ("Insert buffer \n");
+
   list = jbuf->packets->tail;
 
   /* no seqnum, simply append then */
