@@ -669,6 +669,8 @@ rtp_jitter_buffer_insert (RTPJitterBuffer * jbuf, RTPJitterBufferItem * item,
   guint16 seqnum;
   GstClockTime dts;
 
+GST_DEBUG ("INSERT BY SERBAN\n");
+
   g_return_val_if_fail (jbuf != NULL, FALSE);
   g_return_val_if_fail (item != NULL, FALSE);
 
