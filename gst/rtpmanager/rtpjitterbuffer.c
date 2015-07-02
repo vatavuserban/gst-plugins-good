@@ -672,7 +672,7 @@ rtp_jitter_buffer_insert (RTPJitterBuffer * jbuf, RTPJitterBufferItem * item,
   g_return_val_if_fail (jbuf != NULL, FALSE);
   g_return_val_if_fail (item != NULL, FALSE);
 
-  GST_DEBUG ("Insert buffer \n");
+  GST_DEBUG ("Insert buffer SERBAN\n");
 
   list = jbuf->packets->tail;
 
